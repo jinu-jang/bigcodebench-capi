@@ -26,6 +26,7 @@ def make_model(
     tp: int = 1,
     direct_completion: bool = False,
     base_url: str = None,
+    parallel_workers: int = 1,
     trust_remote_code: bool = False,
     # hf only
     attn_implementation: str = "eager",
@@ -101,6 +102,7 @@ def make_model(
             max_new_tokens=max_new_tokens,
             reasoning_effort=reasoning_effort,
             base_url=base_url,
+            parallel_workers=parallel_workers,
             instruction_prefix=instruction_prefix,
             response_prefix=response_prefix,
         )

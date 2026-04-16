@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import multiprocessing
 import os
@@ -39,25 +40,53 @@ from bigcodebench.gen.util import trusted_check
 Result = Tuple[str, List[bool]]
 
 
+def build_groundtruth_cache_hash(subset: str, problems: Dict[str, Any]) -> str:
+    dataset_hash = get_bigcodebench_hash(subset=subset)
+    problem_hash = hashlib.md5()
+    for task_id in sorted(problems):
+        problem_hash.update(task_id.encode("utf-8"))
+        problem_hash.update(b"\n")
+    return f"{dataset_hash}-{problem_hash.hexdigest()}"
+
+
+def load_cached_groundtruth(cache_file: str, problems: Dict[str, Any]) -> dict[str, Any] | None:
+    with open(cache_file, "rb") as f:
+        cached_groundtruth = pickle.load(f)
+
+    if not isinstance(cached_groundtruth, dict):
+        return None
+
+    missing_task_ids = [task_id for task_id in problems if task_id not in cached_groundtruth]
+    if missing_task_ids:
+        print(
+            f"Ignoring incomplete ground-truth cache at {cache_file}; "
+            f"missing {len(missing_task_ids)} task(s)."
+        )
+        return None
+
+    return cached_groundtruth
+
+
 def get_groundtruth(n_workers, problems, hashcode, check_gt_only, max_as_limit, max_data_limit, max_stack_limit, min_time_limit):
     cache_file = os.path.join(CACHE_DIR, f"{hashcode}.pkl")
     if os.path.exists(cache_file):
         if check_gt_only:
             os.remove(cache_file)
         else:
-            print(f"Load from ground-truth from {cache_file}")
-            with open(cache_file, "rb") as f:
-                return pickle.load(f)
+            cached_groundtruth = load_cached_groundtruth(cache_file, problems)
+            if cached_groundtruth is not None:
+                print(f"Load from ground-truth from {cache_file}")
+                return cached_groundtruth
 
     os.makedirs(CACHE_DIR, exist_ok=True)
     print("\nAsserting the groundtruth...")
     tbegin = time.time()
-    
+
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         futures = []
         n_samples = 0
         expected_time = dict()
-        
+
         for problem in problems.values():
             args = (
                 problem["complete_prompt"] + "\n" + problem["canonical_solution"],
@@ -68,16 +97,16 @@ def get_groundtruth(n_workers, problems, hashcode, check_gt_only, max_as_limit, 
                 max_stack_limit,
                 min_time_limit,
             )
-            
+
             futures.append(executor.submit(trusted_check, *args))
             n_samples += 1
 
         for future in tqdm(as_completed(futures), total=n_samples):
             result = future.result()
             expected_time[result["task_id"]] = result["time"]
-    
+
     print(f"Expected outputs computed in {time.time() - tbegin:.2f}s")
-    
+
     if any(expected_time.values()):
         with open(cache_file, "wb") as f:
             pickle.dump(expected_time, f)
@@ -134,25 +163,25 @@ def evaluate(
     check_gt_only: bool = False,
     no_gt: bool = False,
     **model_kwargs,
-):  
+):
     if not samples and model_kwargs:
         samples = run_codegen(
             split=split,
             subset=subset,
             **model_kwargs,
         )
-    
+
     if no_execute:
         return
-    
+
     assert samples is not None, "No samples provided"
-        
+
     if os.path.isdir(samples):
         result_path = os.path.join(samples, "eval_results.json")
     else:
         assert samples.endswith(".jsonl")
         result_path = samples.replace(".jsonl", "_eval_results.json")
-    
+
     if execution == "gradio":
         while True:
             try:
@@ -179,14 +208,14 @@ def evaluate(
                 time.sleep(4)
         gt_pass_rate = pass_at_k["gt_pass_rate"]
         failed_tasks = pass_at_k["failed_tasks"]
-    
+
     elif execution == "e2b":
         sandbox = Sandbox(e2b_endpoint, api_key=os.environ["E2B_API_KEY"], timeout=60*60)
 
         # upload file to sandbox
         with open(samples, "r") as file:
             sandbox.files.write(samples, file)
-        
+
         # run the evaluation
         print(f"Command run in sandbox {e2b_endpoint}")
         command = "bigcodebench.evaluate  --execution 'local' "\
@@ -194,7 +223,7 @@ def evaluate(
                         f"--pass_k {pass_k} --save_pass_rate {save_pass_rate} --calibrated {calibrated} "\
                         f"--parallel {parallel} --selective_evaluate {selective_evaluate} --min_time_limit {min_time_limit} "\
                         f"--max_as_limit {max_as_limit} --max_data_limit {max_data_limit} --max_stack_limit {max_stack_limit} "
-        
+
         if  check_gt_only:
             command += f"--check_gt_only "
         if no_gt:
@@ -202,7 +231,7 @@ def evaluate(
         if no_execute:
             command += f"--no_execute "
         sandbox.commands.run(command, on_stdout=lambda x: print(x), on_stderr=lambda x: print(x), timeout=60*60)
-        
+
         if not check_gt_only:
             # download the results
             content = sandbox.files.read(result_path)
@@ -210,7 +239,7 @@ def evaluate(
                 file.write(content)
 
     else:
-        
+
         pass_at_k = dict()
 
         if isinstance(pass_k, str):
@@ -221,7 +250,7 @@ def evaluate(
             passk = list(pass_k)
         else:
             raise ValueError(f"Invalid type for pass_k: {type(pass_k)}")
-        
+
         if selective_evaluate and isinstance(selective_evaluate, str):
             selected_ids = set(selective_evaluate.split(","))
         else:
@@ -240,23 +269,23 @@ def evaluate(
             samples = "__dummy__.jsonl"
 
         problems = get_bigcodebench(subset=subset)
-        
+
         # Add selective evaluation logic
         if selected_ids:
             problems = {k: v for k, v in problems.items() if k in selected_ids}
             if not problems:
                 raise ValueError(f"None of the provided task IDs {selected_ids} were found in the dataset")
 
-        dataset_hash = get_bigcodebench_hash(subset=subset)
-        
+        dataset_hash = build_groundtruth_cache_hash(subset=subset, problems=problems)
+
         if not no_gt:
             expected_time = get_groundtruth(n_workers, problems, dataset_hash, check_gt_only, max_as_limit, max_data_limit, max_stack_limit, min_time_limit)
         else:
             expected_time = {task_id: None for task_id in problems}
-        
+
         gt_pass_rate = np.mean([1 if v is not None else 0 for k, v in expected_time.items() if k in problems])
         failed_tasks = [k for k, v in expected_time.items() if v is None and k in problems]
-        
+
         if os.path.isfile(result_path):
             print(f"Load from previous results from {result_path}")
             with open(result_path, "r") as f:
@@ -265,17 +294,17 @@ def evaluate(
             results = compatible_eval_result(results)
         else:
             if check_gt_only:
-            
+
                 if gt_pass_rate > 0.99:
                     cprint(f"Groundtruth pass rate: {gt_pass_rate:.3f}", "green")
                 else:
                     cprint(f"Groundtruth pass rate: {gt_pass_rate:.3f}\nPlease be cautious!", "red")
-            
+
                 if len(failed_tasks) > 0:
                     cprint(f"Failed tasks: {failed_tasks}", "red")
-                
+
                 return
-            
+
             else:
                 results = {
                     "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -292,11 +321,11 @@ def evaluate(
                     print("Reading samples...")
                     for sample in tqdm(load_solutions(samples)):
                         task_id = sample["task_id"]
-                        
+
                         if task_id not in problems:
                             # Skip if task is not in problems (either not in dataset or filtered out by selective_evaluate)
                             continue
-                            
+
                         solution = (
                             sample["solution"]
                             if "solution" in sample
@@ -305,6 +334,7 @@ def evaluate(
                         if calibrated:
                             solution = problems[task_id]["code_prompt"] + "\n    pass\n" + solution
                         remainings.add(sample["_identifier"])
+                        task_expected_time = expected_time.get(task_id)
                         args = (
                             completion_id[task_id],
                             problems[task_id],
@@ -314,7 +344,7 @@ def evaluate(
                             max_stack_limit,
                             sample["_identifier"],
                             min_time_limit,
-                            expected_time[task_id] if expected_time[task_id] else 20
+                            task_expected_time if task_expected_time is not None else 20,
                         )
                         futures.append(executor.submit(check_correctness, *args))
                         completion_id[task_id] += 1
@@ -380,11 +410,11 @@ def evaluate(
         pass_at_k["calibrated"] = calibrated
         pass_at_k["gt_pass_rate"] = gt_pass_rate
         pass_at_k["failed_tasks"] = failed_tasks
-            
+
     extra = subset.capitalize()
     split = split.capitalize()
     cprint(f"BigCodeBench-{split} ({extra})", "green")
-        
+
     if no_gt:
         cprint(f"Groundtruth is not checked", "yellow")
     else:
@@ -392,10 +422,10 @@ def evaluate(
             cprint(f"Groundtruth pass rate: {gt_pass_rate:.3f}", "green")
         else:
             cprint(f"Groundtruth pass rate: {gt_pass_rate:.3f}\nPlease be cautious!", "red")
-        
+
         if len(failed_tasks) > 0:
             cprint(f"Failed tasks: {failed_tasks}", "red")
-    
+
     for k, v in pass_at_k.items():
         if k.startswith("pass@"):
             cprint(f"{k}:\t{v:.3f}", "green")
@@ -428,7 +458,7 @@ def evaluate(
             for k in saved_pass_at_k.keys():
                 if pass_at_k[k] != saved_pass_at_k[k]:
                     cprint(f"Warning: {k} is different from the saved one", "yellow")
-                    
+
             # ask user whether to save the pass@k
             decision = ""
             while decision.lower() not in ["y", "n"]:
@@ -440,7 +470,7 @@ def evaluate(
                     new_path += ".bak"
                 os.rename(pass_at_k_path, new_path)
                 print(f"Backup {pass_at_k_path} to {new_path}")
-        
+
         if not os.path.isfile(pass_at_k_path):
             with open(pass_at_k_path, "w") as f:
                 json.dump(pass_at_k, f, indent=2)
